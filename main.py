@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from importlib.metadata import version
 from math import pi
 from numbers import Number
 from typing import Any
@@ -140,6 +141,14 @@ class EvaluationResult:
     barrel_length_m: float | None
     burn_end_position_m: float | None
     message: str
+
+
+@dataclass(frozen=True)
+class VerificationScenario:
+    """Входные данные сценария и ожидаемая классификация результата."""
+
+    input_data: BallisticInput
+    expected_status: EvaluationStatus
 
 
 def build_model_options(input_data: BallisticInput) -> dict[str, Any]:
@@ -618,28 +627,111 @@ def verify_penalty_properties() -> None:
     assert 0.0 < calculate_penalty(small_violation) < calculate_penalty(large_violation)
 
 
-def main() -> None:
-    """Выполнить расчёт критерия и ограничений пробного решения."""
+def build_verification_scenarios() -> tuple[VerificationScenario, ...]:
+    """Создать допустимый, недопустимый и ошибочный сценарии проверки."""
 
-    trial_input = BallisticInput(
-        name="Пробный расчёт варианта 17",
-        chamber_volume_m3=0.025,
-        charges=(PowderCharge(database_name="11/7", mass_kg=11.5),),
+    return (
+        VerificationScenario(
+            input_data=BallisticInput(
+                name="Допустимое решение",
+                chamber_volume_m3=0.035,
+                charges=(PowderCharge(database_name="11/7", mass_kg=10.0),),
+            ),
+            expected_status=EvaluationStatus.FEASIBLE,
+        ),
+        VerificationScenario(
+            input_data=BallisticInput(
+                name="Недопустимое решение",
+                chamber_volume_m3=0.025,
+                charges=(PowderCharge(database_name="11/7", mass_kg=11.5),),
+            ),
+            expected_status=EvaluationStatus.INFEASIBLE,
+        ),
+        VerificationScenario(
+            input_data=BallisticInput(
+                name="Ошибочное решение",
+                chamber_volume_m3=0.035,
+                charges=(
+                    PowderCharge(database_name="__unknown_powder__", mass_kg=10.0),
+                ),
+            ),
+            expected_status=EvaluationStatus.NUMERICAL_ERROR,
+        ),
     )
-    verify_penalty_properties()
-    result = evaluate_solution(trial_input)
-    print(f"{result.input_data.name}: status={result.status}")
+
+
+def print_evaluation(result: EvaluationResult) -> None:
+    """Вывести полный результат одного проверочного сценария."""
+
+    total_charge_mass = sum(
+        charge.mass_kg for charge in result.input_data.charges
+    )
+    charge_description = ", ".join(
+        f"{charge.database_name}: {charge.mass_kg:.6g} кг"
+        for charge in result.input_data.charges
+    )
+    raw_criterion_text = (
+        "не вычислен"
+        if result.raw_criterion is None
+        else f"{result.raw_criterion:.9g} м^3"
+    )
+    print(f"\n=== {result.input_data.name} ===")
     print(
-        f"Критерий={result.raw_criterion!r} м^3; штраф={result.penalty:.6g} м^3; "
-        f"штрафной критерий={result.penalized_criterion:.6g} м^3"
+        f"Входные данные: W_0={result.input_data.chamber_volume_m3:.9g} м^3; "
+        f"заряд=[{charge_description}]; "
+        f"плотность заряжания="
+        f"{total_charge_mass / result.input_data.chamber_volume_m3:.9g} кг/м^3; "
+        f"omega/q={total_charge_mass / PROJECTILE_MASS_KG:.9g}"
     )
-    for constraint in result.constraints:
+    print(f"Статус: {result.status}")
+    print(
+        f"Расчёт +20 °C: {result.normal_run.status}, "
+        f"причина остановки={result.normal_run.stop_reason}"
+    )
+    if result.hot_run is None:
+        print("Расчёт +50 °C: не выполнялся")
+    else:
         print(
-            f"  {constraint.name}: {constraint.actual:.6g} {constraint.unit}; "
-            f"предел={constraint.limit:.6g}; нарушение="
-            f"{constraint.normalized_violation:.6g}; запас={constraint.margin:.6g}"
+            f"Расчёт +50 °C: {result.hot_run.status}, "
+            f"причина остановки={result.hot_run.stop_reason}"
         )
+    print(f"Исходный критерий: {raw_criterion_text}")
+    if result.constraints:
+        print("Ограничения:")
+        for constraint in result.constraints:
+            print(
+                f"  {constraint.name}: факт={constraint.actual:.9g} "
+                f"{constraint.unit}; предел={constraint.limit:.9g} "
+                f"{constraint.unit}; нарушение="
+                f"{constraint.normalized_violation:.9g}; "
+                f"запас={constraint.margin:.9g} {constraint.unit}"
+            )
+    else:
+        print("Ограничения: не вычислены из-за численной ошибки")
+    print(f"Штраф: {result.penalty:.9g} м^3")
+    print(f"Штрафной критерий: {result.penalized_criterion:.9g} м^3")
     print(f"Диагностика: {result.message}")
+
+
+def main() -> None:
+    """Рассчитать и вывести три проверочных баллистических сценария."""
+
+    print(f"pyballistics {version('pyballistics')}")
+    verify_penalty_properties()
+    scenarios = build_verification_scenarios()
+    results = tuple(evaluate_solution(scenario.input_data) for scenario in scenarios)
+    for result in results:
+        print_evaluation(result)
+
+    mismatches = [
+        f"{scenario.input_data.name}: ожидался {scenario.expected_status}, "
+        f"получен {result.status}"
+        for scenario, result in zip(scenarios, results, strict=True)
+        if result.status is not scenario.expected_status
+    ]
+    if mismatches:
+        raise RuntimeError("Ошибки классификации сценариев: " + "; ".join(mismatches))
+    print("\nКлассификация всех сценариев соответствует ожидаемой.")
 
 
 if __name__ == "__main__":
