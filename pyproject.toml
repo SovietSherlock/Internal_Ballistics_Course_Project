@@ -8,7 +8,7 @@ authors = [
 ]
 requires-python = ">=3.14"
 dependencies = [
-    "pyballistics>=1.2.1",
+    "pyballistics==1.2.1",
 ]
 
 [project.scripts]
