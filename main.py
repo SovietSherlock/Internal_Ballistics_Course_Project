@@ -7,9 +7,15 @@ from enum import StrEnum
 from importlib.metadata import version
 from math import pi
 from numbers import Number
+from pathlib import Path
 from typing import Any
 
+import matplotlib
 import numpy as np
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 from pyballistics import ozvb_lagrange
 
 
@@ -36,6 +42,12 @@ MAX_BURN_POSITION_RATIO = 0.6
 MAX_HOT_MUZZLE_PRESSURE_PA = 100.0e6
 PENALTY_SCALE_M3 = 1.0
 NUMERICAL_ERROR_PENALTY_M3 = 1.0e6
+
+FIGURE_DIRECTORY = Path("figures")
+FIGURE_DPI = 300
+SCENARIO_LINESTYLES = ("-", "--", "-.", ":")
+SCENARIO_MARKERS = ("o", "s", "^", "D")
+SCENARIO_GRAYS = ("black", "0.45", "0.25", "0.65")
 
 
 @dataclass(frozen=True)
@@ -713,6 +725,268 @@ def print_evaluation(result: EvaluationResult) -> None:
     print(f"Диагностика: {result.message}")
 
 
+def _series_until_position(
+    series: BallisticSeries, values: np.ndarray, position_m: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Обрезать ряд по положению и добавить интерполированную конечную точку."""
+
+    positions = series.projectile_position_m
+    mask = positions <= position_m
+    selected_positions = positions[mask].copy()
+    selected_values = values[mask].copy()
+    if position_m < positions[-1] and (
+        selected_positions.size == 0
+        or not np.isclose(selected_positions[-1], position_m)
+    ):
+        selected_positions = np.append(selected_positions, position_m)
+        selected_values = np.append(
+            selected_values,
+            _value_at_position(series, values, position_m),
+        )
+    return selected_positions, selected_values
+
+
+def _line_parameters(index: int, point_count: int) -> dict[str, Any]:
+    """Вернуть различимый в чёрно-белой печати стиль линии сценария."""
+
+    return {
+        "color": SCENARIO_GRAYS[index % len(SCENARIO_GRAYS)],
+        "linestyle": SCENARIO_LINESTYLES[index % len(SCENARIO_LINESTYLES)],
+        "marker": SCENARIO_MARKERS[index % len(SCENARIO_MARKERS)],
+        "markevery": max(1, point_count // 12),
+        "linewidth": 1.6,
+        "markersize": 4.0,
+        "markerfacecolor": "white",
+    }
+
+
+def _save_figure(figure: plt.Figure, filename: str) -> Path:
+    """Сохранить рисунок с заданным разрешением и закрыть его."""
+
+    path = FIGURE_DIRECTORY / filename
+    figure.savefig(path, dpi=FIGURE_DPI, bbox_inches="tight")
+    plt.close(figure)
+    return path
+
+
+def _plot_velocity(results: tuple[EvaluationResult, ...]) -> Path:
+    figure, axis = plt.subplots(figsize=(7.2, 4.8), constrained_layout=True)
+    for index, result in enumerate(results):
+        series = result.normal_series
+        if series is None:
+            continue
+        positions, velocities = _series_until_position(
+            series,
+            series.projectile_velocity_m_s,
+            MAX_BARREL_LENGTH_M,
+        )
+        axis.plot(
+            positions,
+            velocities,
+            label=result.input_data.name,
+            **_line_parameters(index, len(positions)),
+        )
+    axis.axhline(
+        TARGET_VELOCITY_M_S,
+        color="black",
+        linestyle=":",
+        linewidth=1.4,
+        label="Требуемая скорость 700 м/с",
+    )
+    axis.set(
+        xlabel="Положение снаряда, м",
+        ylabel="Скорость снаряда, м/с",
+        title="Изменение скорости снаряда при +20 °C",
+        xlim=(0.0, MAX_BARREL_LENGTH_M),
+    )
+    axis.grid(True, linestyle=":", linewidth=0.6, color="0.75")
+    axis.legend()
+    return _save_figure(figure, "velocity.png")
+
+
+def _plot_pressure(results: tuple[EvaluationResult, ...]) -> Path:
+    figure, axes = plt.subplots(2, 1, figsize=(7.2, 8.0), constrained_layout=True)
+    normal_axis, hot_axis = axes
+    for index, result in enumerate(results):
+        if result.barrel_length_m is None:
+            continue
+        if result.normal_series is not None:
+            positions, pressures = _series_until_position(
+                result.normal_series,
+                result.normal_series.mean_pressure_pa,
+                result.barrel_length_m,
+            )
+            normal_axis.plot(
+                positions,
+                pressures / 1.0e6,
+                label=result.input_data.name,
+                **_line_parameters(index, len(positions)),
+            )
+        if result.hot_series is not None:
+            positions, pressures = _series_until_position(
+                result.hot_series,
+                result.hot_series.mean_pressure_pa,
+                result.barrel_length_m,
+            )
+            hot_axis.plot(
+                positions,
+                pressures / 1.0e6,
+                label=result.input_data.name,
+                **_line_parameters(index, len(positions)),
+            )
+
+    normal_axis.axhline(
+        MAX_MEAN_PRESSURE_PA / 1.0e6,
+        color="black",
+        linestyle=":",
+        linewidth=1.4,
+        label="Предел 350 МПа",
+    )
+    hot_axis.axhline(
+        MAX_HOT_MUZZLE_PRESSURE_PA / 1.0e6,
+        color="black",
+        linestyle=":",
+        linewidth=1.4,
+        label="Дульный предел 100 МПа",
+    )
+    normal_axis.set(
+        xlabel="Положение снаряда, м",
+        ylabel="Среднее давление, МПа",
+        title="Среднебаллистическое давление при +20 °C",
+    )
+    hot_axis.set(
+        xlabel="Положение снаряда, м",
+        ylabel="Среднее давление, МПа",
+        title="Среднебаллистическое давление при +50 °C",
+    )
+    for axis in axes:
+        axis.set_xlim(left=0.0)
+        axis.set_ylim(bottom=0.0)
+        axis.grid(True, linestyle=":", linewidth=0.6, color="0.75")
+        axis.legend()
+    return _save_figure(figure, "pressure.png")
+
+
+def _plot_burned_fraction(results: tuple[EvaluationResult, ...]) -> Path:
+    figure, axis = plt.subplots(figsize=(7.2, 4.8), constrained_layout=True)
+    for index, result in enumerate(results):
+        if result.normal_series is None or result.barrel_length_m is None:
+            continue
+        positions, fractions = _series_until_position(
+            result.normal_series,
+            result.normal_series.burned_fraction,
+            result.barrel_length_m,
+        )
+        axis.plot(
+            positions / result.barrel_length_m,
+            fractions,
+            label=result.input_data.name,
+            **_line_parameters(index, len(positions)),
+        )
+    axis.axvline(
+        MAX_BURN_POSITION_RATIO,
+        color="black",
+        linestyle=":",
+        linewidth=1.4,
+        label="Предел eta_e = 0,6",
+    )
+    axis.axhline(
+        1.0,
+        color="0.35",
+        linestyle="-.",
+        linewidth=1.2,
+        label="Полное сгорание",
+    )
+    axis.set(
+        xlabel="Относительное положение снаряда, x/l_m",
+        ylabel="Доля сгоревшего заряда, 1",
+        title="Полнота сгорания заряда при +20 °C",
+        xlim=(0.0, 1.0),
+        ylim=(0.0, 1.05),
+    )
+    axis.grid(True, linestyle=":", linewidth=0.6, color="0.75")
+    axis.legend()
+    return _save_figure(figure, "burned_fraction.png")
+
+
+def _constraint_usage(constraint: ConstraintCheck) -> float:
+    """Привести ограничение к форме, в которой допустимо значение не более 1."""
+
+    if constraint.kind is ConstraintKind.LOWER:
+        return constraint.limit / constraint.actual
+    return constraint.actual / constraint.limit
+
+
+def _plot_normalized_constraints(results: tuple[EvaluationResult, ...]) -> Path:
+    constrained_results = tuple(result for result in results if result.constraints)
+    labels = (
+        "v_треб/v(50d)",
+        "p_m_max/350",
+        "l_m/(50d)",
+        "eta_e/0,6",
+        "p_mz/100",
+    )
+    positions = np.arange(len(labels), dtype=float)
+    width = 0.36
+    figure, axis = plt.subplots(figsize=(8.2, 5.0), constrained_layout=True)
+    all_usages: list[float] = []
+    for index, result in enumerate(constrained_results):
+        usages = [_constraint_usage(item) for item in result.constraints]
+        all_usages.extend(usages)
+        offset = (index - (len(constrained_results) - 1) / 2.0) * width
+        bars = axis.bar(
+            positions + offset,
+            usages,
+            width,
+            label=result.input_data.name,
+            facecolor="white" if index % 2 == 0 else "0.75",
+            edgecolor="black",
+            linewidth=1.0,
+            hatch="//" if index % 2 == 0 else "xx",
+        )
+        axis.bar_label(bars, fmt="%.2f", padding=2, fontsize=10)
+    axis.axhline(
+        1.0,
+        color="black",
+        linestyle=":",
+        linewidth=1.5,
+        label="Допустимый уровень",
+    )
+    axis.set(
+        ylabel="Нормированное использование ограничения, 1",
+        title="Сопоставление ограничений баллистических решений",
+        xticks=positions,
+        xticklabels=labels,
+        ylim=(0.0, max(1.2, max(all_usages, default=1.0) * 1.18)),
+    )
+    axis.grid(True, axis="y", linestyle=":", linewidth=0.6, color="0.75")
+    axis.legend()
+    return _save_figure(figure, "normalized_constraints.png")
+
+
+def create_figures(results: tuple[EvaluationResult, ...]) -> tuple[Path, ...]:
+    """Автоматически пересоздать полный комплект баллистических рисунков."""
+
+    plt.rcParams.update(
+        {
+            "font.family": "DejaVu Serif",
+            "font.size": 10,
+            "axes.titlesize": 11,
+            "axes.labelsize": 10,
+            "xtick.labelsize": 10,
+            "ytick.labelsize": 10,
+            "legend.fontsize": 10,
+        }
+    )
+    FIGURE_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    return (
+        _plot_velocity(results),
+        _plot_pressure(results),
+        _plot_burned_fraction(results),
+        _plot_normalized_constraints(results),
+    )
+
+
 def main() -> None:
     """Рассчитать и вывести три проверочных баллистических сценария."""
 
@@ -731,7 +1005,11 @@ def main() -> None:
     ]
     if mismatches:
         raise RuntimeError("Ошибки классификации сценариев: " + "; ".join(mismatches))
+    figure_paths = create_figures(results)
     print("\nКлассификация всех сценариев соответствует ожидаемой.")
+    print("Рисунки пересозданы:")
+    for path in figure_paths:
+        print(f"  {path.as_posix()}")
 
 
 if __name__ == "__main__":
