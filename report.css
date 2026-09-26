@@ -89,6 +89,14 @@ h1.structural {
     text-align: center;
 }
 
+.title-top p,
+.title-center p,
+.title-bottom p {
+    margin: 0;
+    text-align: center;
+    text-indent: 0;
+}
+
 .title-center {
     margin-top: 38mm;
 }
@@ -207,6 +215,12 @@ li {
     margin: -10pt 0 14pt;
     text-align: center;
     font-weight: bold;
+}
+
+.appendix-subtitle p {
+    margin: 0;
+    text-align: center;
+    text-indent: 0;
 }
 
 pre {
