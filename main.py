@@ -12,12 +12,10 @@ from typing import Any
 
 import matplotlib
 import numpy as np
+from pyballistics import ozvb_lagrange
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
-from pyballistics import ozvb_lagrange
-
 
 # Исходные данные варианта № 17 в единицах СИ.
 CALIBER_M = 0.1524
@@ -48,6 +46,7 @@ FIGURE_DPI = 300
 SCENARIO_LINESTYLES = ("-", "--", "-.", ":")
 SCENARIO_MARKERS = ("o", "s", "^", "D")
 SCENARIO_GRAYS = ("black", "0.45", "0.25", "0.65")
+BOUNDARY_CONSTRAINT_NAME = "p_mz(+50 °C)"
 
 
 @dataclass(frozen=True)
@@ -161,6 +160,8 @@ class VerificationScenario:
 
     input_data: BallisticInput
     expected_status: EvaluationStatus
+    include_in_ballistic_figures: bool = False
+    include_in_penalty_series: bool = False
 
 
 def build_model_options(input_data: BallisticInput) -> dict[str, Any]:
@@ -235,7 +236,7 @@ def run_model_safely(input_data: BallisticInput) -> ModelRun:
     options = build_model_options(input_data)
     try:
         raw_result = ozvb_lagrange(options)
-    except Exception as error:  # защитная граница для ошибок вне pyballistics
+    except Exception as error:  # noqa: BLE001 - защитная граница модели
         return ModelRun(
             input_data=input_data,
             status=RunStatus.SOLVER_ERROR,
@@ -330,7 +331,9 @@ def extract_ballistic_series(run: ModelRun) -> BallisticSeries:
         p = np.asarray(layer["p"], dtype=float)
         dx = np.diff(x)
         if len(p) != len(dx) or np.any(dx <= 0.0):
-            raise ValueError(f"некорректная пространственная сетка в слое {layer_index}")
+            raise ValueError(
+                f"некорректная пространственная сетка в слое {layer_index}"
+            )
 
         charge_burn = []
         for charge_index in range(1, len(charge_masses) + 1):
@@ -370,9 +373,11 @@ def _first_crossing(
         return float(abscissa[0]), right
     left = right - 1
     denominator = float(ordinate[right] - ordinate[left])
-    fraction = 0.0 if abs(denominator) < 1.0e-14 else (
-        level - float(ordinate[left])
-    ) / denominator
+    fraction = (
+        0.0
+        if abs(denominator) < 1.0e-14
+        else (level - float(ordinate[left])) / denominator
+    )
     fraction = min(1.0, max(0.0, fraction))
     value = float(abscissa[left] + fraction * (abscissa[right] - abscissa[left]))
     return value, right
@@ -556,11 +561,6 @@ def evaluate_solution(input_data: BallisticInput) -> EvaluationResult:
         normal_series.mean_pressure_pa,
         barrel_length,
     )
-    velocity_at_length_limit = _value_at_position(
-        normal_series,
-        normal_series.projectile_velocity_m_s,
-        MAX_BARREL_LENGTH_M,
-    )
     hot_muzzle_pressure = _value_at_position(
         hot_series,
         hot_series.mean_pressure_pa,
@@ -568,13 +568,6 @@ def evaluate_solution(input_data: BallisticInput) -> EvaluationResult:
     )
 
     constraints = (
-        _lower_constraint(
-            "v_pm(+20 °C)",
-            velocity_at_length_limit,
-            TARGET_VELOCITY_M_S,
-            "м/с",
-            "скорость на предельной длине 50d",
-        ),
         _upper_constraint(
             "p_m_max(+20 °C)",
             max_mean_pressure,
@@ -623,9 +616,9 @@ def evaluate_solution(input_data: BallisticInput) -> EvaluationResult:
         penalized_criterion=criterion + penalty,
         barrel_length_m=barrel_length,
         burn_end_position_m=burn_end_position,
-        message="ограничения выполнены" if status is EvaluationStatus.FEASIBLE else (
-            "расчёт выполнен, но нарушено одно или несколько ограничений"
-        ),
+        message="ограничения выполнены"
+        if status is EvaluationStatus.FEASIBLE
+        else ("расчёт выполнен, но нарушено одно или несколько ограничений"),
     )
 
 
@@ -640,7 +633,7 @@ def verify_penalty_properties() -> None:
 
 
 def build_verification_scenarios() -> tuple[VerificationScenario, ...]:
-    """Создать допустимый, недопустимый и ошибочный сценарии проверки."""
+    """Создать основной и доказательный набор проверочных точек."""
 
     return (
         VerificationScenario(
@@ -650,6 +643,34 @@ def build_verification_scenarios() -> tuple[VerificationScenario, ...]:
                 charges=(PowderCharge(database_name="11/7", mass_kg=10.0),),
             ),
             expected_status=EvaluationStatus.FEASIBLE,
+            include_in_ballistic_figures=True,
+        ),
+        VerificationScenario(
+            input_data=BallisticInput(
+                name="Граница снизу",
+                chamber_volume_m3=0.035,
+                charges=(PowderCharge(database_name="11/7", mass_kg=11.495),),
+            ),
+            expected_status=EvaluationStatus.FEASIBLE,
+            include_in_penalty_series=True,
+        ),
+        VerificationScenario(
+            input_data=BallisticInput(
+                name="Граница сверху",
+                chamber_volume_m3=0.035,
+                charges=(PowderCharge(database_name="11/7", mass_kg=11.500),),
+            ),
+            expected_status=EvaluationStatus.INFEASIBLE,
+            include_in_penalty_series=True,
+        ),
+        VerificationScenario(
+            input_data=BallisticInput(
+                name="Увеличенное нарушение",
+                chamber_volume_m3=0.035,
+                charges=(PowderCharge(database_name="11/7", mass_kg=11.600),),
+            ),
+            expected_status=EvaluationStatus.INFEASIBLE,
+            include_in_penalty_series=True,
         ),
         VerificationScenario(
             input_data=BallisticInput(
@@ -658,6 +679,7 @@ def build_verification_scenarios() -> tuple[VerificationScenario, ...]:
                 charges=(PowderCharge(database_name="11/7", mass_kg=11.5),),
             ),
             expected_status=EvaluationStatus.INFEASIBLE,
+            include_in_ballistic_figures=True,
         ),
         VerificationScenario(
             input_data=BallisticInput(
@@ -672,12 +694,67 @@ def build_verification_scenarios() -> tuple[VerificationScenario, ...]:
     )
 
 
+def _constraint_by_name(result: EvaluationResult, name: str) -> ConstraintCheck:
+    """Найти рассчитанное ограничение по его устойчивому имени."""
+
+    for constraint in result.constraints:
+        if constraint.name == name:
+            return constraint
+    raise ValueError(
+        f"в результате {result.input_data.name!r} отсутствует ограничение {name!r}"
+    )
+
+
+def verify_calculated_evidence(
+    scenarios: tuple[VerificationScenario, ...],
+    results: tuple[EvaluationResult, ...],
+) -> None:
+    """Проверить близкую пару и рост штрафа на рассчитанных точках."""
+
+    penalty_results = tuple(
+        result
+        for scenario, result in zip(scenarios, results, strict=True)
+        if scenario.include_in_penalty_series
+    )
+    if len(penalty_results) != 3:
+        raise RuntimeError("для доказательной серии требуются ровно три точки")
+
+    constraints = tuple(
+        _constraint_by_name(result, BOUNDARY_CONSTRAINT_NAME)
+        for result in penalty_results
+    )
+    below, above, farther = constraints
+    below_result, above_result, farther_result = penalty_results
+    if not below.actual < below.limit < above.actual < farther.actual:
+        raise RuntimeError(
+            "точки доказательной серии не образуют переход через выбранную границу"
+        )
+    if not below_result.penalty == 0.0 < above_result.penalty < farther_result.penalty:
+        raise RuntimeError("штраф не возрастает с величиной рассчитанного нарушения")
+
+    for result in (above_result, farther_result):
+        violated = tuple(
+            item.name for item in result.constraints if not item.is_satisfied
+        )
+        if violated != (BOUNDARY_CONSTRAINT_NAME,):
+            raise RuntimeError(
+                f"точка {result.input_data.name!r} должна изолированно нарушать "
+                f"ограничение {BOUNDARY_CONSTRAINT_NAME!r}, получено: {violated}"
+            )
+
+    print("\nДоказательная серия у границы p_mz(+50 °C) = 100 МПа:")
+    for result, constraint in zip(penalty_results, constraints, strict=True):
+        print(
+            f"  {result.input_data.name}: p_mz={constraint.actual / 1.0e6:.6f} МПа; "
+            f"нарушение={constraint.normalized_violation:.9g}; "
+            f"штраф={result.penalty:.9g} м^3"
+        )
+
+
 def print_evaluation(result: EvaluationResult) -> None:
     """Вывести полный результат одного проверочного сценария."""
 
-    total_charge_mass = sum(
-        charge.mass_kg for charge in result.input_data.charges
-    )
+    total_charge_mass = sum(charge.mass_kg for charge in result.input_data.charges)
     charge_description = ", ".join(
         f"{charge.database_name}: {charge.mass_kg:.6g} кг"
         for charge in result.input_data.charges
@@ -920,7 +997,6 @@ def _constraint_usage(constraint: ConstraintCheck) -> float:
 def _plot_normalized_constraints(results: tuple[EvaluationResult, ...]) -> Path:
     constrained_results = tuple(result for result in results if result.constraints)
     labels = (
-        "v_треб/v(50d)",
         "p_m_max/350",
         "l_m/(50d)",
         "eta_e/0,6",
@@ -964,7 +1040,87 @@ def _plot_normalized_constraints(results: tuple[EvaluationResult, ...]) -> Path:
     return _save_figure(figure, "normalized_constraints.png")
 
 
-def create_figures(results: tuple[EvaluationResult, ...]) -> tuple[Path, ...]:
+def _plot_penalty_growth(results: tuple[EvaluationResult, ...]) -> Path:
+    """Показать переход через выбранную границу и рост штрафа."""
+
+    charge_masses = np.asarray(
+        [
+            sum(charge.mass_kg for charge in result.input_data.charges)
+            for result in results
+        ]
+    )
+    constraints = tuple(
+        _constraint_by_name(result, BOUNDARY_CONSTRAINT_NAME) for result in results
+    )
+    pressures_mpa = np.asarray([item.actual / 1.0e6 for item in constraints])
+    penalties_m3 = np.asarray([result.penalty for result in results])
+
+    figure, axes = plt.subplots(
+        2, 1, figsize=(7.2, 7.2), sharex=True, constrained_layout=True
+    )
+    pressure_axis, penalty_axis = axes
+    pressure_axis.plot(
+        charge_masses,
+        pressures_mpa,
+        color="black",
+        linestyle="-",
+        marker="o",
+        markerfacecolor="white",
+        linewidth=1.6,
+    )
+    pressure_axis.axhline(
+        MAX_HOT_MUZZLE_PRESSURE_PA / 1.0e6,
+        color="black",
+        linestyle=":",
+        linewidth=1.4,
+        label="Предел 100 МПа",
+    )
+    pressure_axis.set(
+        ylabel="Дульное давление при +50 °C, МПа",
+        title="Переход через границу горячего дульного давления",
+    )
+    pressure_axis.legend()
+
+    penalty_axis.plot(
+        charge_masses,
+        penalties_m3,
+        color="black",
+        linestyle="--",
+        marker="s",
+        markerfacecolor="white",
+        linewidth=1.6,
+    )
+    annotation_styles = (
+        {"xytext": (-10, 14), "ha": "right"},
+        {"xytext": (10, 30), "ha": "left"},
+        {"xytext": (0, 8), "ha": "center"},
+    )
+    for mass, penalty, style in zip(
+        charge_masses, penalties_m3, annotation_styles, strict=True
+    ):
+        penalty_axis.annotate(
+            f"{penalty:.3e}",
+            (mass, penalty),
+            xytext=style["xytext"],
+            textcoords="offset points",
+            ha=style["ha"],
+            fontsize=9,
+        )
+    penalty_axis.set(
+        xlabel="Масса заряда 11/7, кг",
+        ylabel="Штраф, м³",
+        title="Рост штрафа с величиной нарушения",
+        ylim=(-0.05 * max(penalties_m3), 1.22 * max(penalties_m3)),
+    )
+    for axis in axes:
+        axis.grid(True, linestyle=":", linewidth=0.6, color="0.75")
+    return _save_figure(figure, "penalty_growth.png")
+
+
+def create_figures(
+    ballistic_results: tuple[EvaluationResult, ...],
+    penalty_results: tuple[EvaluationResult, ...],
+) -> tuple[Path, ...]:
     """Автоматически пересоздать полный комплект баллистических рисунков."""
 
     plt.rcParams.update(
@@ -980,15 +1136,16 @@ def create_figures(results: tuple[EvaluationResult, ...]) -> tuple[Path, ...]:
     )
     FIGURE_DIRECTORY.mkdir(parents=True, exist_ok=True)
     return (
-        _plot_velocity(results),
-        _plot_pressure(results),
-        _plot_burned_fraction(results),
-        _plot_normalized_constraints(results),
+        _plot_velocity(ballistic_results),
+        _plot_pressure(ballistic_results),
+        _plot_burned_fraction(ballistic_results),
+        _plot_normalized_constraints(ballistic_results),
+        _plot_penalty_growth(penalty_results),
     )
 
 
 def main() -> None:
-    """Рассчитать и вывести три проверочных баллистических сценария."""
+    """Рассчитать и вывести основной и доказательный набор точек."""
 
     print(f"pyballistics {version('pyballistics')}")
     verify_penalty_properties()
@@ -1005,7 +1162,18 @@ def main() -> None:
     ]
     if mismatches:
         raise RuntimeError("Ошибки классификации сценариев: " + "; ".join(mismatches))
-    figure_paths = create_figures(results)
+    verify_calculated_evidence(scenarios, results)
+    ballistic_results = tuple(
+        result
+        for scenario, result in zip(scenarios, results, strict=True)
+        if scenario.include_in_ballistic_figures
+    )
+    penalty_results = tuple(
+        result
+        for scenario, result in zip(scenarios, results, strict=True)
+        if scenario.include_in_penalty_series
+    )
+    figure_paths = create_figures(ballistic_results, penalty_results)
     print("\nКлассификация всех сценариев соответствует ожидаемой.")
     print("Рисунки пересозданы:")
     for path in figure_paths:

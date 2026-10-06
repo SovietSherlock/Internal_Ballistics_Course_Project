@@ -148,6 +148,8 @@ table {
     border-collapse: collapse;
     font-size: 11pt;
     line-height: 1.15;
+    break-inside: avoid;
+    page-break-inside: avoid;
 }
 
 thead {

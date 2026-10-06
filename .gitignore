@@ -1,3 +1,7 @@
 TODO.md
 __pycache__/
 *.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+lab1_*.zip

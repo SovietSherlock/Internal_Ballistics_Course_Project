@@ -1,20 +1,17 @@
 [project]
 name = "internal-ballistics-course-project"
 version = "0.1.0"
-description = "Add your description here"
+description = "Воспроизводимый прямой расчёт внутренней баллистики для варианта 17"
 readme = "README.md"
 authors = [
-    { name = "Bebra_02", email = "savvabaryshev@gmail.com" }
+    { name = "Барышев Савва", email = "savvabaryshev@gmail.com" }
 ]
-requires-python = ">=3.14"
+requires-python = ">=3.11"
 dependencies = [
     "matplotlib>=3.11.2",
+    "numpy>=2.3.3",
     "pyballistics==1.2.1",
 ]
 
-[project.scripts]
-internal-ballistics-course-project = "internal_ballistics_course_project:main"
-
-[build-system]
-requires = ["uv_build>=0.12.19,<0.13.0"]
-build-backend = "uv_build"
+[tool.uv]
+package = false
