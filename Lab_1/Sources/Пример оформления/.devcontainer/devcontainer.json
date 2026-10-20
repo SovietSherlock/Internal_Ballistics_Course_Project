@@ -1,0 +1,22 @@
+{
+  "name": "Lecture 02 — Python project",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "remoteUser": "vscode",
+  "containerEnv": {
+    "UV_PROJECT_ENVIRONMENT": "/home/vscode/.venvs/course-motion"
+  },
+  "postCreateCommand": "uv sync --locked",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/home/vscode/.venvs/course-motion/bin/python"
+      }
+    }
+  }
+}

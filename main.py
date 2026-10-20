@@ -132,6 +132,7 @@ class ConstraintCheck:
 class EvaluationStatus(StrEnum):
     FEASIBLE = "feasible"
     INFEASIBLE = "infeasible"
+    INCOMPLETE = "incomplete"
     NUMERICAL_ERROR = "numerical_error"
 
 
@@ -142,13 +143,15 @@ class EvaluationResult:
     input_data: BallisticInput
     status: EvaluationStatus
     normal_run: ModelRun
+    diagnostic_normal_run: ModelRun | None
     hot_run: ModelRun | None
     normal_series: BallisticSeries | None
+    diagnostic_normal_series: BallisticSeries | None
     hot_series: BallisticSeries | None
     constraints: tuple[ConstraintCheck, ...]
     raw_criterion: float | None
-    penalty: float
-    penalized_criterion: float
+    penalty: float | None
+    penalized_criterion: float | None
     barrel_length_m: float | None
     burn_end_position_m: float | None
     message: str
@@ -164,8 +167,18 @@ class VerificationScenario:
     include_in_penalty_series: bool = False
 
 
-def build_model_options(input_data: BallisticInput) -> dict[str, Any]:
+def build_model_options(
+    input_data: BallisticInput, *, velocity_stop_m_s: float | None = None
+) -> dict[str, Any]:
     """Преобразовать явное описание решения во входной словарь pyballistics."""
+
+    stop_conditions: dict[str, float | int] = {
+        "x_p": input_data.stop_position_m,
+        "p_max": MAX_MODEL_PRESSURE_PA,
+        "steps_max": MAX_MODEL_STEPS,
+    }
+    if velocity_stop_m_s is not None:
+        stop_conditions["v_p"] = velocity_stop_m_s
 
     return {
         "powders": [
@@ -186,11 +199,7 @@ def build_model_options(input_data: BallisticInput) -> dict[str, Any]:
             "n_cells": input_data.cell_count,
             "CFL": input_data.cfl,
         },
-        "stop_conditions": {
-            "x_p": input_data.stop_position_m,
-            "p_max": MAX_MODEL_PRESSURE_PA,
-            "steps_max": MAX_MODEL_STEPS,
-        },
+        "stop_conditions": stop_conditions,
     }
 
 
@@ -230,10 +239,12 @@ def _validate_layers(layers: object) -> tuple[dict[str, Any], ...]:
     return tuple(checked_layers)
 
 
-def run_model_safely(input_data: BallisticInput) -> ModelRun:
+def run_model_safely(
+    input_data: BallisticInput, *, velocity_stop_m_s: float | None = None
+) -> ModelRun:
     """Безопасно вызвать модель и преобразовать любую ошибку в ``ModelRun``."""
 
-    options = build_model_options(input_data)
+    options = build_model_options(input_data, velocity_stop_m_s=velocity_stop_m_s)
     try:
         raw_result = ozvb_lagrange(options)
     except Exception as error:  # noqa: BLE001 - защитная граница модели
@@ -452,8 +463,11 @@ def _numerical_error_evaluation(
     normal_run: ModelRun,
     message: str,
     *,
+    diagnostic_normal_run: ModelRun | None = None,
     hot_run: ModelRun | None = None,
     normal_series: BallisticSeries | None = None,
+    diagnostic_normal_series: BallisticSeries | None = None,
+    hot_series: BallisticSeries | None = None,
     criterion: float | None = None,
     barrel_length_m: float | None = None,
 ) -> EvaluationResult:
@@ -462,9 +476,11 @@ def _numerical_error_evaluation(
         input_data=input_data,
         status=EvaluationStatus.NUMERICAL_ERROR,
         normal_run=normal_run,
+        diagnostic_normal_run=diagnostic_normal_run,
         hot_run=hot_run,
         normal_series=normal_series,
-        hot_series=None,
+        diagnostic_normal_series=diagnostic_normal_series,
+        hot_series=hot_series,
         constraints=(),
         raw_criterion=criterion,
         penalty=NUMERICAL_ERROR_PENALTY_M3,
@@ -475,15 +491,76 @@ def _numerical_error_evaluation(
     )
 
 
-def evaluate_solution(input_data: BallisticInput) -> EvaluationResult:
-    """Рассчитать решение при +20/+50 °C, критерий, ограничения и штраф."""
+def _incomplete_evaluation(
+    input_data: BallisticInput,
+    normal_run: ModelRun,
+    message: str,
+    *,
+    normal_series: BallisticSeries | None = None,
+    diagnostic_normal_run: ModelRun | None = None,
+    diagnostic_normal_series: BallisticSeries | None = None,
+    hot_run: ModelRun | None = None,
+    hot_series: BallisticSeries | None = None,
+    criterion: float | None = None,
+    barrel_length_m: float | None = None,
+) -> EvaluationResult:
+    """Вернуть диагностический результат без полной проверки ограничений.
 
-    normal_input = replace(
+    Такой результат означает, что базовая цель не достигнута или горячий
+    расчёт не дошёл до общего среза. Ряды сохраняются для диагностики, но
+    критерий, штраф и дульная классификация не подменяются доступной конечной
+    точкой.
+    """
+
+    return EvaluationResult(
+        input_data=input_data,
+        status=EvaluationStatus.INCOMPLETE,
+        normal_run=normal_run,
+        diagnostic_normal_run=diagnostic_normal_run,
+        hot_run=hot_run,
+        normal_series=normal_series,
+        diagnostic_normal_series=diagnostic_normal_series,
+        hot_series=hot_series,
+        constraints=(),
+        raw_criterion=criterion,
+        penalty=None,
+        penalized_criterion=None,
+        barrel_length_m=barrel_length_m,
+        burn_end_position_m=None,
+        message=message,
+    )
+
+
+def _ends_at_position(series: BallisticSeries, position_m: float) -> bool:
+    """Проверить, что ряд действительно дошёл до требуемого среза."""
+
+    return bool(
+        np.isclose(
+            series.projectile_position_m[-1],
+            position_m,
+            rtol=1.0e-9,
+            atol=1.0e-8,
+        )
+    )
+
+
+def evaluate_solution(input_data: BallisticInput) -> EvaluationResult:
+    """Рассчитать целевую и диагностическую ветви одного решения.
+
+    Базовая ветвь останавливается по первой достигнутой целевой скорости или
+    по защитному пределу. Только останов ``v_p`` позволяет определять $l_m$,
+    критерий и запускать полноценную горячую проверку. Если цель не достигнута,
+    дополнительный расчёт сохраняется исключительно как диагностика.
+    """
+
+    normal_target_input = replace(
         input_data,
         temperature_k=NORMAL_TEMPERATURE_K,
-        stop_position_m=max(input_data.stop_position_m, ANALYSIS_STOP_POSITION_M),
+        stop_position_m=MAX_BARREL_LENGTH_M,
     )
-    normal_run = run_model_safely(normal_input)
+    normal_run = run_model_safely(
+        normal_target_input, velocity_stop_m_s=TARGET_VELOCITY_M_S
+    )
     if not normal_run.is_successful:
         return _numerical_error_evaluation(
             input_data,
@@ -500,17 +577,58 @@ def evaluate_solution(input_data: BallisticInput) -> EvaluationResult:
             f"ошибка обработки расчёта при +20 °C: {error}",
         )
 
+    if normal_run.stop_reason != "v_p":
+        diagnostic_input = replace(
+            input_data,
+            temperature_k=NORMAL_TEMPERATURE_K,
+            stop_position_m=max(input_data.stop_position_m, ANALYSIS_STOP_POSITION_M),
+        )
+        diagnostic_run = run_model_safely(diagnostic_input)
+        diagnostic_series: BallisticSeries | None = None
+        diagnostic_note: str
+        if diagnostic_run.is_successful:
+            try:
+                diagnostic_series = extract_ballistic_series(diagnostic_run)
+                diagnostic_note = (
+                    "дополнительный расчёт сохранён до "
+                    f"x={diagnostic_series.projectile_position_m[-1]:.9g} м, "
+                    f"v={diagnostic_series.projectile_velocity_m_s[-1]:.9g} м/с, "
+                    f"останов={diagnostic_run.stop_reason}"
+                )
+            except (TypeError, ValueError, IndexError) as error:
+                diagnostic_note = f"дополнительный ряд некорректен: {error}"
+        else:
+            diagnostic_note = (
+                "дополнительный расчёт не получен: "
+                f"{diagnostic_run.status}, останов={diagnostic_run.stop_reason}"
+            )
+        return _incomplete_evaluation(
+            input_data,
+            normal_run,
+            "целевая скорость 700 м/с не достигнута до защитного предела "
+            f"x={normal_series.projectile_position_m[-1]:.9g} м; "
+            f"v={normal_series.projectile_velocity_m_s[-1]:.9g} м/с; "
+            f"останов={normal_run.stop_reason}. {diagnostic_note}",
+            normal_series=normal_series,
+            diagnostic_normal_run=diagnostic_run,
+            diagnostic_normal_series=diagnostic_series,
+        )
+
     velocity_crossing = _first_crossing(
         normal_series.projectile_position_m,
         normal_series.projectile_velocity_m_s,
         TARGET_VELOCITY_M_S,
     )
     if velocity_crossing is None:
-        barrel_length = float(normal_series.projectile_position_m[-1])
-        velocity_note = "скорость не достигнута; длина является нижней оценкой"
-    else:
-        barrel_length, _ = velocity_crossing
-        velocity_note = "длина интерполирована при первом достижении скорости"
+        return _numerical_error_evaluation(
+            input_data,
+            normal_run,
+            "модель сообщила останов v_p, но в рядах нет целевой скорости",
+            normal_series=normal_series,
+        )
+
+    barrel_length, _ = velocity_crossing
+    velocity_note = "длина интерполирована при первом достижении скорости"
 
     criterion = raw_criterion(input_data.chamber_volume_m3, barrel_length)
     hot_input = replace(
@@ -541,6 +659,20 @@ def evaluate_solution(input_data: BallisticInput) -> EvaluationResult:
             normal_series=normal_series,
             criterion=criterion,
             barrel_length_m=barrel_length,
+        )
+
+    if hot_run.stop_reason != "x_p" or not _ends_at_position(hot_series, barrel_length):
+        return _incomplete_evaluation(
+            input_data,
+            normal_run,
+            "горячий расчёт не дошёл до общего среза; "
+            f"ожидалось x={barrel_length:.9g} м, получено "
+            f"x={hot_series.projectile_position_m[-1]:.9g} м, "
+            f"останов={hot_run.stop_reason}. Дульное ограничение, штраф и "
+            "полная классификация не вычислены.",
+            normal_series=normal_series,
+            hot_run=hot_run,
+            hot_series=hot_series,
         )
 
     burn_crossing = _first_crossing(
@@ -607,8 +739,10 @@ def evaluate_solution(input_data: BallisticInput) -> EvaluationResult:
         input_data=input_data,
         status=status,
         normal_run=normal_run,
+        diagnostic_normal_run=None,
         hot_run=hot_run,
         normal_series=normal_series,
+        diagnostic_normal_series=None,
         hot_series=hot_series,
         constraints=constraints,
         raw_criterion=criterion,
@@ -644,6 +778,14 @@ def build_verification_scenarios() -> tuple[VerificationScenario, ...]:
             ),
             expected_status=EvaluationStatus.FEASIBLE,
             include_in_ballistic_figures=True,
+        ),
+        VerificationScenario(
+            input_data=BallisticInput(
+                name="Цель не достигнута (диагностика)",
+                chamber_volume_m3=0.035,
+                charges=(PowderCharge(database_name="11/7", mass_kg=2.0),),
+            ),
+            expected_status=EvaluationStatus.INCOMPLETE,
         ),
         VerificationScenario(
             input_data=BallisticInput(
@@ -718,6 +860,8 @@ def verify_calculated_evidence(
     )
     if len(penalty_results) != 3:
         raise RuntimeError("для доказательной серии требуются ровно три точки")
+    if any(result.status not in {EvaluationStatus.FEASIBLE, EvaluationStatus.INFEASIBLE} for result in penalty_results):
+        raise RuntimeError("в доказательной серии есть неполный расчёт")
 
     constraints = tuple(
         _constraint_by_name(result, BOUNDARY_CONSTRAINT_NAME)
@@ -751,6 +895,47 @@ def verify_calculated_evidence(
         )
 
 
+def verify_incomplete_target_diagnostic(
+    scenarios: tuple[VerificationScenario, ...],
+    results: tuple[EvaluationResult, ...],
+) -> None:
+    """Проверить, что недостижение цели не подменяется полным решением."""
+
+    diagnostic_results = tuple(
+        result
+        for scenario, result in zip(scenarios, results, strict=True)
+        if scenario.expected_status is EvaluationStatus.INCOMPLETE
+    )
+    if len(diagnostic_results) != 1:
+        raise RuntimeError("требуется ровно один сценарий неполного целевого расчёта")
+
+    result = diagnostic_results[0]
+    if result.status is not EvaluationStatus.INCOMPLETE:
+        raise RuntimeError("недостижение цели не выделено отдельным статусом")
+    if result.raw_criterion is not None or result.barrel_length_m is not None:
+        raise RuntimeError("не достигнутая цель не должна определять l_m или W_pm")
+    if result.constraints or result.penalty is not None or result.penalized_criterion is not None:
+        raise RuntimeError("неполный целевой расчёт не должен получать штраф")
+    if result.hot_run is not None:
+        raise RuntimeError("горячий расчёт нельзя запускать без корректной целевой длины")
+    if result.diagnostic_normal_run is None or result.diagnostic_normal_series is None:
+        raise RuntimeError("для недостижения цели отсутствует дополнительная диагностика")
+    if result.normal_run.stop_reason == "v_p":
+        raise RuntimeError("неполный сценарий неожиданно достиг целевой скорости")
+    if (
+        result.diagnostic_normal_series.projectile_position_m[-1]
+        < result.normal_series.projectile_position_m[-1]
+    ):
+        raise RuntimeError("диагностический расчёт не сохранил продолжение траектории")
+
+    print(
+        "\nНеполный целевой расчёт сохранён только как диагностика: "
+        f"останов={result.normal_run.stop_reason}; "
+        f"x_защ={result.normal_series.projectile_position_m[-1]:.6f} м; "
+        f"x_диаг={result.diagnostic_normal_series.projectile_position_m[-1]:.6f} м"
+    )
+
+
 def print_evaluation(result: EvaluationResult) -> None:
     """Вывести полный результат одного проверочного сценария."""
 
@@ -764,6 +949,25 @@ def print_evaluation(result: EvaluationResult) -> None:
         if result.raw_criterion is None
         else f"{result.raw_criterion:.9g} м^3"
     )
+    penalty_text = (
+        "не вычислен"
+        if result.penalty is None
+        else f"{result.penalty:.9g} м^3"
+    )
+    penalized_text = (
+        "не вычислен"
+        if result.penalized_criterion is None
+        else f"{result.penalized_criterion:.9g} м^3"
+    )
+
+    def endpoint_text(series: BallisticSeries | None) -> str:
+        if series is None:
+            return "конечные данные отсутствуют"
+        return (
+            f"x={series.projectile_position_m[-1]:.9g} м; "
+            f"v={series.projectile_velocity_m_s[-1]:.9g} м/с"
+        )
+
     print(f"\n=== {result.input_data.name} ===")
     print(
         f"Входные данные: W_0={result.input_data.chamber_volume_m3:.9g} м^3; "
@@ -775,14 +979,22 @@ def print_evaluation(result: EvaluationResult) -> None:
     print(f"Статус: {result.status}")
     print(
         f"Расчёт +20 °C: {result.normal_run.status}, "
-        f"причина остановки={result.normal_run.stop_reason}"
+        f"причина остановки={result.normal_run.stop_reason}; "
+        f"{endpoint_text(result.normal_series)}"
     )
+    if result.diagnostic_normal_run is not None:
+        print(
+            f"Диагностика +20 °C: {result.diagnostic_normal_run.status}, "
+            f"причина остановки={result.diagnostic_normal_run.stop_reason}; "
+            f"{endpoint_text(result.diagnostic_normal_series)}"
+        )
     if result.hot_run is None:
         print("Расчёт +50 °C: не выполнялся")
     else:
         print(
             f"Расчёт +50 °C: {result.hot_run.status}, "
-            f"причина остановки={result.hot_run.stop_reason}"
+            f"причина остановки={result.hot_run.stop_reason}; "
+            f"{endpoint_text(result.hot_series)}"
         )
     print(f"Исходный критерий: {raw_criterion_text}")
     if result.constraints:
@@ -796,9 +1008,9 @@ def print_evaluation(result: EvaluationResult) -> None:
                 f"запас={constraint.margin:.9g} {constraint.unit}"
             )
     else:
-        print("Ограничения: не вычислены из-за численной ошибки")
-    print(f"Штраф: {result.penalty:.9g} м^3")
-    print(f"Штрафной критерий: {result.penalized_criterion:.9g} м^3")
+        print("Ограничения: не вычислены для неполного или численно ошибочного расчёта")
+    print(f"Штраф: {penalty_text}")
+    print(f"Штрафной критерий: {penalized_text}")
     print(f"Диагностика: {result.message}")
 
 
@@ -1163,6 +1375,7 @@ def main() -> None:
     if mismatches:
         raise RuntimeError("Ошибки классификации сценариев: " + "; ".join(mismatches))
     verify_calculated_evidence(scenarios, results)
+    verify_incomplete_target_diagnostic(scenarios, results)
     ballistic_results = tuple(
         result
         for scenario, result in zip(scenarios, results, strict=True)
